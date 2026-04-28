@@ -1,0 +1,8 @@
+checkpoints*
+data*
+face*
+*.png
+*.pkl
+logs
+*.pt
+raw*
