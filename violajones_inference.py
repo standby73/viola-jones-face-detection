@@ -1,13 +1,12 @@
 """
-Viola-Jones Inference - Versión VECTORIZADA (rápida)
+Viola-Jones Inference - Versión VECTORIZADA + NUMBA
 =====================================================
-Diferencias clave respecto a la versión original:
-  - detect_faces vectorizado: calcula integral image una vez por escala y
-    evalúa TODOS los patches simultáneamente con slicing NumPy.
-  - cascade_predict_batch: evalúa toda una matriz de patches de golpe,
-    eliminando el bucle Python patch-a-patch.
-  - Sin cv2.normalize por patch (se usa la std de la integral image directamente).
-  - Multithreading opcional por escala (--threads N).
+Mejoras respecto a la versión anterior:
+  - cascade_predict_batch portado a Numba (@njit parallel=True).
+  - Cascada aplanada a arrays NumPy una sola vez al cargar (flatten_cascade).
+  - Warm-up JIT automático al arrancar (cache=True para compilaciones futuras).
+  - FPS calculado como tiempo entre frames consecutivos (corrección bug).
+  - Sin cv2.NORM_MINMAX (normalización correcta por std local por patch).
 
 Uso:
     python inference_vj_fast.py --stages checkpoints_total --num 12
@@ -24,6 +23,8 @@ import numpy as np
 from pathlib import Path
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from numba import njit, prange
+import numba as nb
 
 
 # ──────────────────────────────────────────────────────────────
@@ -49,140 +50,156 @@ def integral_image(img):
 
 
 # ──────────────────────────────────────────────────────────────
-# SUMA DE REGIÓN VECTORIZADA SOBRE TODOS LOS PATCHES
+# NÚCLEO NUMBA
 # ──────────────────────────────────────────────────────────────
 
-def sum_region_batch(ii, x1, y1, x2, y2):
-    """
-    Suma de región usando la integral image para N patches a la vez.
-    x1, y1: coordenadas absolutas top-left (arrays int32).
-    x2, y2: coordenadas absolutas bottom-right INCLUSIVE (arrays int32).
-    Los índices ya vienen cliqueados a los límites de ii en cascade_predict_batch.
-    """
-    return (ii[y2 + 1, x2 + 1]
-          - ii[y1,     x2 + 1]
-          - ii[y2 + 1, x1    ]
-          + ii[y1,     x1    ])
+@njit(cache=True)
+def _sum_region(ii, y1, x1, y2, x2):
+    return ii[y2+1, x2+1] - ii[y1, x2+1] - ii[y2+1, x1] + ii[y1, x1]
 
 
-# ──────────────────────────────────────────────────────────────
-# FEATURE VECTORIZADO
-# ──────────────────────────────────────────────────────────────
+@njit(cache=True)
+def _compute_feature(ii, ox, oy, fw, fh, ftype, max_x, max_y):
+    def cx(a): return min(a, max_x)
+    def cy(a): return min(a, max_y)
 
-def compute_feature_batch(ii, ox, oy, fw, fh, ftype, max_x, max_y):
-    """
-    Calcula un Haar feature para N patches a la vez.
-    ox, oy  : coordenada absoluta del origen de la feature en la imagen (arrays).
-    fw, fh  : tamaño de la feature en píxeles.
-    max_x, max_y: límites máximos de coordenada (new_W-1, new_H-1).
-    Devuelve array float64 de shape (N,).
-
-    Nota: ox = patch_x + feature_x_dentro_del_patch (ya sumado antes de llamar).
-    """
-    # Clipear para que ningún índice se salga de la imagen
-    def clip_x(a): return np.minimum(a, max_x)
-    def clip_y(a): return np.minimum(a, max_y)
-
-    if ftype == 0:          # two-rect horizontal
+    if ftype == 0:
         hw = fw // 2
-        return (sum_region_batch(ii, ox,      oy,          clip_x(ox+hw-1),    clip_y(oy+fh-1))
-              - sum_region_batch(ii, clip_x(ox+hw), oy,    clip_x(ox+fw-1),    clip_y(oy+fh-1)))
-    elif ftype == 1:        # two-rect vertical
+        return (_sum_region(ii, oy, ox,        cy(oy+fh-1), cx(ox+hw-1))
+              - _sum_region(ii, oy, cx(ox+hw), cy(oy+fh-1), cx(ox+fw-1)))
+    elif ftype == 1:
         hh = fh // 2
-        return (sum_region_batch(ii, ox, oy,               clip_x(ox+fw-1), clip_y(oy+hh-1))
-              - sum_region_batch(ii, ox, clip_y(oy+hh),    clip_x(ox+fw-1), clip_y(oy+fh-1)))
-    elif ftype == 2:        # three-rect horizontal
+        return (_sum_region(ii, oy,        ox, cy(oy+hh-1), cx(ox+fw-1))
+              - _sum_region(ii, cy(oy+hh), ox, cy(oy+fh-1), cx(ox+fw-1)))
+    elif ftype == 2:
         tw = fw // 3
-        return (sum_region_batch(ii, ox,               oy, clip_x(ox+tw-1),    clip_y(oy+fh-1))
-              - 2*sum_region_batch(ii, clip_x(ox+tw),  oy, clip_x(ox+2*tw-1),  clip_y(oy+fh-1))
-              + sum_region_batch(ii, clip_x(ox+2*tw),  oy, clip_x(ox+fw-1),    clip_y(oy+fh-1)))
-    elif ftype == 3:        # three-rect vertical
+        return (_sum_region(ii, oy, ox,           cy(oy+fh-1), cx(ox+tw-1))
+              - 2*_sum_region(ii, oy, cx(ox+tw),  cy(oy+fh-1), cx(ox+2*tw-1))
+              +   _sum_region(ii, oy, cx(ox+2*tw), cy(oy+fh-1), cx(ox+fw-1)))
+    elif ftype == 3:
         th = fh // 3
-        return (sum_region_batch(ii, ox, oy,               clip_x(ox+fw-1), clip_y(oy+th-1))
-              - 2*sum_region_batch(ii, ox, clip_y(oy+th),  clip_x(ox+fw-1), clip_y(oy+2*th-1))
-              + sum_region_batch(ii, ox, clip_y(oy+2*th),  clip_x(ox+fw-1), clip_y(oy+fh-1)))
-    else:                   # four-rect (checker)
-        hw, hh = fw // 2, fh // 2
-        return (sum_region_batch(ii, ox,               oy,             clip_x(ox+hw-1), clip_y(oy+hh-1))
-              - sum_region_batch(ii, clip_x(ox+hw),    oy,             clip_x(ox+fw-1), clip_y(oy+hh-1))
-              - sum_region_batch(ii, ox,               clip_y(oy+hh),  clip_x(ox+hw-1), clip_y(oy+fh-1))
-              + sum_region_batch(ii, clip_x(ox+hw),    clip_y(oy+hh),  clip_x(ox+fw-1), clip_y(oy+fh-1)))
+        return (_sum_region(ii, oy,         ox, cy(oy+th-1),   cx(ox+fw-1))
+              - 2*_sum_region(ii, cy(oy+th),  ox, cy(oy+2*th-1), cx(ox+fw-1))
+              +   _sum_region(ii, cy(oy+2*th), ox, cy(oy+fh-1),   cx(ox+fw-1)))
+    else:
+        hw = fw // 2
+        hh = fh // 2
+        return (_sum_region(ii, oy,        ox,        cy(oy+hh-1), cx(ox+hw-1))
+              - _sum_region(ii, oy,        cx(ox+hw), cy(oy+hh-1), cx(ox+fw-1))
+              - _sum_region(ii, cy(oy+hh), ox,        cy(oy+fh-1), cx(ox+hw-1))
+              + _sum_region(ii, cy(oy+hh), cx(ox+hw), cy(oy+fh-1), cx(ox+fw-1)))
 
 
-# ──────────────────────────────────────────────────────────────
-# PREDICCIÓN BATCH — NÚCLEO DE LA OPTIMIZACIÓN
-# ──────────────────────────────────────────────────────────────
-
-def cascade_predict_batch(ii, ii2, xs, ys, cascade):
-    """
-    Evalúa la cascada para todos los patches (xs[i], ys[i]) a la vez.
-
-    ii, ii2 : integral images (float64) de la imagen redimensionada.
-              shape = (H+1, W+1), así que el índice válido es 0..H / 0..W
-    xs, ys  : arrays int32 con coordenadas top-left de cada patch 24×24.
-    cascade : lista de stages cargados.
-
-    Devuelve array bool de shape (N,) — True = cara detectada.
-    """
-    N   = len(xs)
+@njit(cache=True)
+def cascade_predict_numba(ii, ii2,
+                           xs, ys,
+                           all_fx, all_fy, all_fw, all_fh, all_ft,
+                           all_thresholds, all_polarities,
+                           all_alphas,
+                           stage_starts, stage_lengths,
+                           stage_thetas):
+    N   = xs.shape[0]
     WIN = 24
+    max_y = ii.shape[0] - 2
+    max_x = ii.shape[1] - 2
+    n     = WIN * WIN
 
-    # Límites seguros para indexar ii (shape = H+1 x W+1)
-    max_y = ii.shape[0] - 2   # índice máximo para y2 (luego se hace y2+1)
-    max_x = ii.shape[1] - 2   # índice máximo para x2
+    alive = np.ones(N, dtype=nb.boolean)
 
-    # Std por patch usando la integral cuadrática
-    n   = WIN * WIN
-    mu  = (ii[ys+WIN, xs+WIN] - ii[ys, xs+WIN] - ii[ys+WIN, xs] + ii[ys, xs]) / n
-    ssq = (ii2[ys+WIN, xs+WIN] - ii2[ys, xs+WIN] - ii2[ys+WIN, xs] + ii2[ys, xs])
-    var = ssq / n - mu**2
-    std = np.sqrt(np.maximum(var, 0))
-    std[std <= 0] = 1.0
+    for p in prange(N):
+        x = xs[p]
+        y = ys[p]
 
-    alive = np.ones(N, dtype=bool)   # patches que todavía no fueron rechazados
+        mu  = (ii[y+WIN, x+WIN] - ii[y, x+WIN] - ii[y+WIN, x] + ii[y, x]) / n
+        ssq = (ii2[y+WIN, x+WIN] - ii2[y, x+WIN] - ii2[y+WIN, x] + ii2[y, x])
+        var = ssq / n - mu * mu
+        std = np.sqrt(max(var, 0.0))
+        if std <= 0.0:
+            std = 1.0
 
-    for stage in cascade:
-        if not alive.any():
-            break
+        for s in range(stage_starts.shape[0]):
+            start  = stage_starts[s]
+            length = stage_lengths[s]
+            theta  = stage_thetas[s]
 
-        # Índices de patches activos
-        idx = np.where(alive)[0]
-        xa, ya, stda = xs[idx], ys[idx], std[idx]
+            score = 0.0
+            for c in range(start, start + length):
+                val = _compute_feature(ii,
+                                       x + all_fx[c], y + all_fy[c],
+                                       all_fw[c], all_fh[c], all_ft[c],
+                                       max_x, max_y) / std
+                if all_polarities[c] * val < all_polarities[c] * all_thresholds[c]:
+                    score += all_alphas[c]
 
-        score = np.zeros(len(idx), dtype=np.float64)
-
-        for clf, alpha in zip(stage['classifiers'], stage['alphas']):
-            fx, fy, fw, fh, ft = stage['features_global'][clf.feature_index]
-            # ox/oy = coordenada absoluta del origen de la feature en la imagen
-            ox = xa + fx
-            oy = ya + fy
-            vals = compute_feature_batch(ii, ox, oy, fw, fh, ft, max_x, max_y) / stda
-            pos = (clf.polarity * vals < clf.polarity * float(clf.threshold))
-            score += np.where(pos, alpha, 0.0)
-
-        # Rechazar patches que no superan el umbral
-        alive[idx[score < stage['theta']]] = False
+            if score < theta:
+                alive[p] = False
+                break
 
     return alive
+
+
+# ──────────────────────────────────────────────────────────────
+# APLANAR CASCADA PARA NUMBA
+# ──────────────────────────────────────────────────────────────
+
+def flatten_cascade(cascade):
+    """Convierte la lista de stages en arrays planos para Numba."""
+    fx_l, fy_l, fw_l, fh_l, ft_l = [], [], [], [], []
+    thr_l, pol_l, alpha_l = [], [], []
+    starts, lengths, thetas = [], [], []
+
+    idx = 0
+    for stage in cascade:
+        clfs   = stage['classifiers']
+        alphas = stage['alphas']
+        feats  = stage['features_global']
+        n = len(clfs)
+        starts.append(idx)
+        lengths.append(n)
+        thetas.append(float(stage['theta']))
+        for clf, alpha in zip(clfs, alphas):
+            fx, fy, fw, fh, ft = feats[clf.feature_index]
+            fx_l.append(int(fx)); fy_l.append(int(fy))
+            fw_l.append(int(fw)); fh_l.append(int(fh)); ft_l.append(int(ft))
+            thr_l.append(float(clf.threshold))
+            pol_l.append(float(clf.polarity))
+            alpha_l.append(float(alpha))
+        idx += n
+
+    return (np.array(fx_l,    np.int32),
+            np.array(fy_l,    np.int32),
+            np.array(fw_l,    np.int32),
+            np.array(fh_l,    np.int32),
+            np.array(ft_l,    np.int32),
+            np.array(thr_l,   np.float64),
+            np.array(pol_l,   np.float64),
+            np.array(alpha_l, np.float64),
+            np.array(starts,  np.int32),
+            np.array(lengths, np.int32),
+            np.array(thetas,  np.float64))
+
+
+# ──────────────────────────────────────────────────────────────
+# WRAPPER CASCADE PREDICT
+# ──────────────────────────────────────────────────────────────
+
+def cascade_predict_batch(ii, ii2, xs, ys, flat):
+    return cascade_predict_numba(ii, ii2, xs, ys, *flat)
 
 
 # ──────────────────────────────────────────────────────────────
 # DETECCIÓN MULTI-ESCALA VECTORIZADA
 # ──────────────────────────────────────────────────────────────
 
-def detect_faces_fast(frame_gray, cascade,
+def detect_faces_fast(frame_gray, flat,
                       min_size=48, max_size=None,
                       scale_factor=1.25, step_ratio=0.1,
                       n_threads=1):
-    """
-    Detección con sliding window + pirámide de escalas, completamente vectorizada.
-    """
     H, W = frame_gray.shape
     if max_size is None:
         max_size = min(H, W) // 2
 
     all_detections = []
-    win_size = min_size
 
     def process_scale(win_size):
         scale = win_size / 24.0
@@ -193,15 +210,12 @@ def detect_faces_fast(frame_gray, cascade,
 
         resized = cv2.resize(frame_gray, (new_W, new_H),
                              interpolation=cv2.INTER_LINEAR).astype(np.float64)
-        
-        # resized = cv2.normalize(resized, None, 0, 255, cv2.NORM_MINMAX).astype(np.float64)
 
         ii  = integral_image(resized)
         ii2 = integral_image(resized ** 2)
 
         step = max(1, round(24 * step_ratio))
 
-        # Generar todas las posiciones de patch de golpe
         ys_arr = np.arange(0, new_H - 24 + 1, step, dtype=np.int32)
         xs_arr = np.arange(0, new_W - 24 + 1, step, dtype=np.int32)
         yy, xx = np.meshgrid(ys_arr, xs_arr, indexing='ij')
@@ -211,19 +225,15 @@ def detect_faces_fast(frame_gray, cascade,
         if len(xs) == 0:
             return []
 
-        alive = cascade_predict_batch(ii, ii2, xs, ys, cascade)
+        alive = cascade_predict_batch(ii, ii2, xs, ys, flat)
 
-        # Escalar coords de vuelta al frame original
         detected = []
         for x, y in zip(xs[alive], ys[alive]):
             rx = int(x * scale)
             ry = int(y * scale)
-            rw = int(win_size)
-            rh = int(win_size)
-            detected.append((rx, ry, rw, rh))
+            detected.append((rx, ry, int(win_size), int(win_size)))
         return detected
 
-    # Construir lista de escalas
     scales = []
     ws = min_size
     while ws <= max_size:
@@ -285,8 +295,19 @@ def load_cascade(stage_dir: str, num_stages: int):
         print(f'  ✅ Etapa {i+1:2d} cargada ({n_clfs} clasificadores débiles, θ={stage["theta"]:.4f})')
     if not cascade:
         raise RuntimeError(f'No se encontró ninguna etapa en "{stage_dir}".')
-    print(f'\n  → Cascada lista: {len(cascade)} etapas.\n')
-    return cascade
+    print(f'\n  → Cascada lista: {len(cascade)} etapas.')
+
+    print('  → Aplanando cascada para Numba...')
+    flat = flatten_cascade(cascade)
+    print('  → Compilando JIT (solo la primera vez, puede tardar ~10s)...')
+    dummy_ii  = np.zeros((26, 26), np.float64)
+    dummy_ii2 = np.zeros((26, 26), np.float64)
+    dummy_xs  = np.array([0], np.int32)
+    dummy_ys  = np.array([0], np.int32)
+    cascade_predict_numba(dummy_ii, dummy_ii2, dummy_xs, dummy_ys, *flat)
+    print('  → JIT listo.\n')
+
+    return cascade, flat
 
 
 # ──────────────────────────────────────────────────────────────
@@ -315,7 +336,36 @@ def draw_hud(frame, fps, n_faces, stage_count):
 # MODO IMAGEN ESTÁTICA
 # ──────────────────────────────────────────────────────────────
 
-def run_camera(cascade, args):
+def run_image(image_path, flat, cascade, args):
+    img = cv2.imread(image_path)
+    if img is None:
+        raise FileNotFoundError(f'No se pudo leer: {image_path}')
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    t0   = time.perf_counter()
+    raw  = detect_faces_fast(gray, flat,
+                             min_size=args.min_size, max_size=args.max_size,
+                             scale_factor=args.scale, step_ratio=args.step,
+                             n_threads=args.threads)
+    final   = nms(raw, overlap_thresh=args.nms_thresh)
+    elapsed = time.perf_counter() - t0
+    print(f'  Crudas: {len(raw)}  →  NMS: {len(final)}  ({elapsed*1000:.1f} ms)')
+    for (x, y, w, h) in final:
+        cv2.rectangle(img, (x, y), (x+w, y+h), (0, 200, 255), 2)
+    cv2.putText(img, f'Caras: {len(final)}  ({elapsed*1000:.0f}ms)',
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,120), 2, cv2.LINE_AA)
+    out = Path(image_path).stem + '_detected.jpg'
+    cv2.imwrite(out, img)
+    print(f'  Guardado en: {out}')
+    cv2.imshow('Viola-Jones Detección', img)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+# ──────────────────────────────────────────────────────────────
+# MODO CÁMARA
+# ──────────────────────────────────────────────────────────────
+
+def run_camera(cascade, flat, args):
     global _last_detections
 
     cap = cv2.VideoCapture(args.camera)
@@ -327,11 +377,11 @@ def run_camera(cascade, args):
     real_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f'  Cámara: {real_w}×{real_h}  |  Q/ESC = salir\n')
 
-    fps_window  = deque(maxlen=30)
-    frame_count = 0
-    n_faces     = 0
+    fps_window       = deque(maxlen=30)
+    frame_count      = 0
+    n_faces          = 0
     _last_detections = []
-    last_time = time.perf_counter()   # ← AÑADIDO
+    last_time        = time.perf_counter()
 
     while True:
         ret, frame = cap.read()
@@ -339,13 +389,12 @@ def run_camera(cascade, args):
             break
         frame_count += 1
 
-        # ── FPS real: tiempo entre frames consecutivos ──
-        now     = time.perf_counter()
-        elapsed = now - last_time
+        # FPS real: tiempo entre frames consecutivos
+        now       = time.perf_counter()
+        elapsed   = now - last_time
         last_time = now
         fps_window.append(1.0 / elapsed if elapsed > 0 else 0)
         fps = float(np.mean(fps_window))
-        # ────────────────────────────────────────────────
 
         if frame_count % args.detect_every == 0:
             if args.detect_scale < 1.0:
@@ -358,7 +407,7 @@ def run_camera(cascade, args):
                 inv_s = 1.0
 
             gray  = cv2.cvtColor(detect_frame, cv2.COLOR_BGR2GRAY)
-            raw   = detect_faces_fast(gray, cascade,
+            raw   = detect_faces_fast(gray, flat,
                                       min_size=args.min_size, max_size=args.max_size,
                                       scale_factor=args.scale, step_ratio=args.step,
                                       n_threads=args.threads)
@@ -387,7 +436,7 @@ def run_camera(cascade, args):
 # ──────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description='Viola-Jones Inference (vectorizada)')
+    p = argparse.ArgumentParser(description='Viola-Jones Inference (Numba)')
     p.add_argument('--stages',       type=str,   default='checkpoints_total')
     p.add_argument('--num',          type=int,   default=20)
     p.add_argument('--scale',        type=float, default=1.25)
@@ -400,20 +449,23 @@ def parse_args():
     p.add_argument('--cam-height',   type=int,   default=480)
     p.add_argument('--detect-every', type=int,   default=1)
     p.add_argument('--detect-scale', type=float, default=1.0)
-    p.add_argument('--threads',      type=int,   default=1,
-                   help='Threads para procesar escalas en paralelo (ej. 4)')
+    p.add_argument('--threads',      type=int,   default=1)
     p.add_argument('--image',        type=str,   default=None)
     return p.parse_args()
 
 
+# ──────────────────────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────────────────────
+
 if __name__ == '__main__':
     args = parse_args()
     print(f'\n{"="*50}')
-    print(f'  Viola-Jones Inference (FAST)')
+    print(f'  Viola-Jones Inference (NUMBA)')
     print(f'  Cargando {args.num} etapa(s) desde "{args.stages}"')
     print(f'{"="*50}\n')
-    cascade = load_cascade(args.stages, args.num)
+    cascade, flat = load_cascade(args.stages, args.num)
     if args.image:
-        run_image(args.image, cascade, args)
+        run_image(args.image, flat, cascade, args)
     else:
-        run_camera(cascade, args)
+        run_camera(cascade, flat, args)

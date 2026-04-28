@@ -6,3 +6,4 @@ face*
 logs
 *.pt
 raw*
+__pycache__
