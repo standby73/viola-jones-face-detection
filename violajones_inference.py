@@ -9,9 +9,9 @@ Mejoras respecto a la versión anterior:
   - Sin cv2.NORM_MINMAX (normalización correcta por std local por patch).
 
 Uso:
-    python inference_vj_fast.py --stages checkpoints_total --num 12
-    python inference_vj_fast.py --stages checkpoints_total --num 12 --scale 1.2 --step 0.1
-    python inference_vj_fast.py --stages checkpoints_total --num 12 --image foto.jpg
+    python violajones_inference.py --stages checkpoints_total --num 12
+    python violajones_inference.py --stages checkpoints_total --num 12 --scale 1.2 --step 0.1
+    python violajones_inference.py --stages checkpoints_total --num 12 --images ( foto.jpg | data/images/ )
 """
 
 import os
@@ -73,14 +73,14 @@ def _compute_feature(ii, ox, oy, fw, fh, ftype, max_x, max_y):
               - _sum_region(ii, cy(oy+hh), ox, cy(oy+fh-1), cx(ox+fw-1)))
     elif ftype == 2:
         tw = fw // 3
-        return (_sum_region(ii, oy, ox,           cy(oy+fh-1), cx(ox+tw-1))
-              - 2*_sum_region(ii, oy, cx(ox+tw),  cy(oy+fh-1), cx(ox+2*tw-1))
-              +   _sum_region(ii, oy, cx(ox+2*tw), cy(oy+fh-1), cx(ox+fw-1)))
+        return (- _sum_region(ii, oy, ox,           cy(oy+fh-1), cx(ox+tw-1))
+              + 2*_sum_region(ii, oy, cx(ox+tw),  cy(oy+fh-1), cx(ox+2*tw-1))
+              - _sum_region(ii, oy, cx(ox+2*tw), cy(oy+fh-1), cx(ox+fw-1)))
     elif ftype == 3:
         th = fh // 3
-        return (_sum_region(ii, oy,         ox, cy(oy+th-1),   cx(ox+fw-1))
-              - 2*_sum_region(ii, cy(oy+th),  ox, cy(oy+2*th-1), cx(ox+fw-1))
-              +   _sum_region(ii, cy(oy+2*th), ox, cy(oy+fh-1),   cx(ox+fw-1)))
+        return (-_sum_region(ii, oy,         ox, cy(oy+th-1),   cx(ox+fw-1))
+              + 2*_sum_region(ii, cy(oy+th),  ox, cy(oy+2*th-1), cx(ox+fw-1))
+              -   _sum_region(ii, cy(oy+2*th), ox, cy(oy+fh-1),   cx(ox+fw-1)))
     else:
         hw = fw // 2
         hh = fh // 2
@@ -441,7 +441,7 @@ def parse_args():
     p.add_argument('--num',          type=int,   default=20)
     p.add_argument('--scale',        type=float, default=1.25)
     p.add_argument('--step',         type=float, default=0.1)
-    p.add_argument('--min-size',     type=int,   default=48)
+    p.add_argument('--min-size',     type=int,   default=24)
     p.add_argument('--max-size',     type=int,   default=None)
     p.add_argument('--nms-thresh',   type=float, default=0.3)
     p.add_argument('--camera',       type=int,   default=0)
