@@ -450,7 +450,7 @@ def parse_args():
     p.add_argument('--detect-every', type=int,   default=1)
     p.add_argument('--detect-scale', type=float, default=1.0)
     p.add_argument('--threads',      type=int,   default=1)
-    p.add_argument('--image',        type=str,   default=None)
+    p.add_argument('--images',        type=str,   default=None)
     return p.parse_args()
 
 
@@ -465,7 +465,18 @@ if __name__ == '__main__':
     print(f'  Cargando {args.num} etapa(s) desde "{args.stages}"')
     print(f'{"="*50}\n')
     cascade, flat = load_cascade(args.stages, args.num)
-    if args.image:
-        run_image(args.image, flat, cascade, args)
+    if args.images:
+        if os.path.isdir(args.images):
+            img_files = [f for f in os.listdir(args.images)
+                         if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+            if not img_files:
+                print(f'  No se encontraron imágenes en "{args.images}".')
+            else:
+                print(f'  Procesando {len(img_files)} imagen(es) en "{args.images}"...\n')
+                for img_file in img_files:
+                    print(f'  → {img_file}')
+                    run_image(os.path.join(args.images, img_file), flat, cascade, args)
+        else:
+            run_image(args.images, flat, cascade, args)
     else:
         run_camera(cascade, flat, args)

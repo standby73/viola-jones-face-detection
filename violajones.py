@@ -26,59 +26,8 @@ from joblib import Parallel, delayed
 from sklearn.metrics import confusion_matrix
 
 # ──────────────────────────────────────────────────────────────
-# 1. CARGA Y PREPROCESAMIENTO DINÁMICO
+# CARGA DE IMÁGENES
 # ──────────────────────────────────────────────────────────────
-def normalize_variance(ii, ii2, h, w):
-    """
-    Calcula σ usando las dos integrales ya calculadas.
-    σ² = E[x²] - E[x]²
-    """
-    N      = h * w
-    mean   = (ii[h, w] - ii[0, w] - ii[h, 0] + ii[0, 0]) / N
-    sum_sq = ii2[h, w] - ii2[0, w] - ii2[h, 0] + ii2[0, 0]
-    var    = (sum_sq / N) - (mean ** 2)
-    return np.sqrt(max(var, 0))
-
-def normalize_with_integral(img):
-    """
-    Normalización rápida usando integral images:
-    (I - mean) / std
-    """
-    img = img.astype(np.float64)
-
-    integral = cv2.integral(img)
-    integral_sq = cv2.integral(img ** 2)
-
-    h, w = img.shape
-
-    sum_ = integral[h, w] - integral[0, w] - integral[h, 0] + integral[0, 0]
-    sum_sq = integral_sq[h, w] - integral_sq[0, w] - integral_sq[h, 0] + integral_sq[0, 0]
-
-    n = h * w
-
-    mean = sum_ / n
-    var = (sum_sq / n) - (mean ** 2)
-    std = np.sqrt(max(var, 1e-6))
-
-    return (img - mean) / (std + 1e-6)
-
-def load_positives(path_faces, test=False):
-    """Carga imágenes positivas y añade automáticamente su versión espejada."""
-    print('Cargando imágenes positivas...')
-    faces_files = [os.path.join(path_faces, f) for f in os.listdir(path_faces) if not f.startswith('.')]
-
-    X_pos = []
-    for fp in tqdm(faces_files, desc='Cargando Positivos (+ Espejo)'):
-        img = cv2.imread(fp, cv2.IMREAD_GRAYSCALE)
-        img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-        if img is not None:
-            X_pos.append(img)
-            if not test:
-                X_pos.append(cv2.flip(img, 1))  # Añadimos la imagen espejo inmediatamente
-
-    print(f'Dataset Positivos: {len(X_pos)} imágenes (incluyendo espejadas).')
-    return X_pos
 
 def load_background_paths(path_bg):
     """
@@ -96,21 +45,40 @@ def load_background_paths(path_bg):
     print(f'Dataset Fondos: {len(bg_paths)} rutas listas para lectura dinámica.')
     return bg_paths
 
-def load_negatives_test(path_backgrounds_test):
-    """Carga imagenes negativas de test."""
-    print('Cargando imágenes negativas de test...')
-    back_files = [os.path.join(path_backgrounds_test, f) for f in os.listdir(path_backgrounds_test) if not f.startswith('.')]
+def load_images(path, is_negative=False, test=False):
+    """Carga imágenes positivas o negativas. Si es positivo y no es test, añade versión Flip."""
+    label = 'Negativos' if is_negative else 'Positivos'
+    mode = 'Test' if test else 'Train'
+    print(f'Cargando imágenes {label} ({mode})...')
 
-    X_pos = []
-    for fp in tqdm(back_files, desc='Cargando Test Negativos'):
+    files = [os.path.join(path, f) for f in os.listdir(path) if not f.startswith('.')]
+
+    images = []
+    for fp in tqdm(files, desc=f'Cargando {label} {mode}'):
         img = cv2.imread(fp, cv2.IMREAD_GRAYSCALE)
-        img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
         if img is not None:
-            X_pos.append(img)
+            images.append(img.astype(np.uint8))
+            if not is_negative and not test:
+                images.append(cv2.flip(img, 1))
 
-    print(f'Dataset negativos test: {len(X_pos)}.')
-    return X_pos
+    suffix = f' (incluyendo su respectivo FLip)' if not is_negative and not test else ''
+    print(f'Dataset {label} {mode}: {len(images)} imágenes{suffix}.')
+    return images
+
+# ──────────────────────────────────────────────────────────────
+# NORMALIZACIÓN, CALCULO INTEGRAL y AUMENTADOS DINÁMICOS
+# ──────────────────────────────────────────────────────────────
+
+def normalize_variance(ii, ii2, h, w):
+    """
+    Calcula σ usando las dos integrales ya calculadas.
+    σ² = E[x²] - E[x]²
+    """
+    N      = h * w
+    mean   = (ii[h, w] - ii[0, w] - ii[h, 0] + ii[0, 0]) / N
+    sum_sq = ii2[h, w] - ii2[0, w] - ii2[h, 0] + ii2[0, 0]
+    var    = (sum_sq / N) - (mean ** 2)
+    return np.sqrt(max(var, 0))
 
 def integral_image(img):
     ii = np.zeros((img.shape[0]+1, img.shape[1]+1), dtype=np.int64)
@@ -132,7 +100,7 @@ def apply_dynamic_augmentation(img):
 
 
 # ──────────────────────────────────────────────────────────────
-# 2. VALIDACIÓN Y MINING DE NEGATIVOS DINÁMICOS
+# VALIDACIÓN Y MINING DE NEGATIVOS DINÁMICOS
 # ──────────────────────────────────────────────────────────────
 
 def is_valid_crop(crop_gray):
@@ -145,9 +113,6 @@ def is_valid_crop(crop_gray):
     if np.mean(crop_gray > 240) > 0.6: return False
     return True
 
-
-
-
 def _mine_dynamic_negatives(bg_paths, cascade, required_n, crop_size=24):
     """
     Lee imágenes dinámicamente desde el disco. Extrae lotes de crops
@@ -157,7 +122,7 @@ def _mine_dynamic_negatives(bg_paths, cascade, required_n, crop_size=24):
     attempts = 0
     max_attempts = required_n * 2000
 
-    CROPS_PER_IMAGE = 50
+    CROPS_PER_IMAGE = 100
 
     desc_str = 'Mining False Positives' if len(cascade) > 0 else 'Mining Random Crops'
     pbar = tqdm(total=required_n, desc=f'  {desc_str}', leave=False)
@@ -184,8 +149,7 @@ def _mine_dynamic_negatives(bg_paths, cascade, required_n, crop_size=24):
 
             crop = bg[y:y + crop_size, x:x + crop_size]
 
-            crop_final = cv2.resize(crop, (24, 24), interpolation=cv2.INTER_AREA)
-            crop_final = cv2.normalize(crop_final, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            crop_final = cv2.resize(crop, (24, 24), interpolation=cv2.INTER_AREA).astype(np.uint8)
 
             if not is_valid_crop(crop_final):
                 attempts += 1
@@ -212,16 +176,12 @@ def _mine_dynamic_negatives(bg_paths, cascade, required_n, crop_size=24):
 
 
 # ──────────────────────────────────────────────────────────────
-# 3. FEATURES DE HAAR
+# FEATURES DE HAAR
 # ──────────────────────────────────────────────────────────────
 
 def sum_region(ii, x1, y1, x2, y2):
-    """Suma de región en integral image. Parámetros: (x1,y1) a (x2,y2) inclusive."""
-    A = ii[y2+1, x2+1]
-    B = ii[y1, x2+1]
-    C = ii[y2+1, x1]
-    D = ii[y1, x1]
-    return int(A - B - C + D)
+    """Suma de región en integral image. Acepta escalares o arrays."""
+    return ii[y2+1, x2+1] - ii[y1, x2+1] - ii[y2+1, x1] + ii[y1, x1]
 
 def compute_feature(ii, x, y, w, h, ftype=0):
     if ftype == 0:
@@ -232,10 +192,10 @@ def compute_feature(ii, x, y, w, h, ftype=0):
         return (sum_region(ii, x, y, x+w-1, y+hh-1) - sum_region(ii, x, y+hh, x+w-1, y+h-1))
     elif ftype == 2:
         tw = w // 3
-        return (sum_region(ii, x, y, x+tw-1, y+h-1) - 2*sum_region(ii, x+tw, y, x+2*tw-1, y+h-1) + sum_region(ii, x+2*tw, y, x+w-1, y+h-1))
+        return (- sum_region(ii, x, y, x+tw-1, y+h-1) + 2*sum_region(ii, x+tw, y, x+2*tw-1, y+h-1) - sum_region(ii, x+2*tw, y, x+w-1, y+h-1))
     elif ftype == 3:
         th = h // 3
-        return (sum_region(ii, x, y, x+w-1, y+th-1) - 2*sum_region(ii, x, y+th, x+w-1, y+2*th-1) + sum_region(ii, x, y+2*th, x+w-1, y+h-1))
+        return (- sum_region(ii, x, y, x+w-1, y+th-1) + 2*sum_region(ii, x, y+th, x+w-1, y+2*th-1) - sum_region(ii, x, y+2*th, x+w-1, y+h-1))
     else:
         hw = w // 2
         hh = h // 2
@@ -280,7 +240,7 @@ def generate_features(img_shape, step=1, max_features=None, seed=42):
 
 
 # ──────────────────────────────────────────────────────────────
-# 4. EXTRACCIÓN DE FEATURES A DISCO (memmap)
+# EXTRACCIÓN DE FEATURES A DISCO (memmap) (PROBLEMAS DE RAM)
 # ──────────────────────────────────────────────────────────────
 
 def _compute_all_features_vectorized(ii, features_np):
@@ -288,11 +248,6 @@ def _compute_all_features_vectorized(ii, features_np):
     features_np: np.array shape (N, 5) con columnas [x, y, w, h, ftype]
     Devuelve: np.array shape (N,) con el valor de cada feature.
     """
-    # ii_pad = np.pad(ii, ((1,0),(1,0)), mode='constant', constant_values=0).astype(np.int64)
-    ii_pad = ii
-
-    def S(r1, c1, r2, c2):
-        return ii_pad[r2+1, c2+1] - ii_pad[r1, c2+1] - ii_pad[r2+1, c1] + ii_pad[r1, c1]
 
     x  = features_np[:, 0].astype(np.int32)
     y  = features_np[:, 1].astype(np.int32)
@@ -305,36 +260,36 @@ def _compute_all_features_vectorized(ii, features_np):
     mask = ft == 0
     if mask.any():
         hw = w[mask] // 2
-        results[mask] = S(y[mask], x[mask], y[mask]+h[mask]-1, x[mask]+hw-1) \
-                      - S(y[mask], x[mask]+hw, y[mask]+h[mask]-1, x[mask]+w[mask]-1)
+        results[mask] = sum_region(ii, x[mask], y[mask], x[mask]+hw-1, y[mask]+h[mask]-1) \
+                        - sum_region(ii, x[mask]+hw, y[mask], x[mask]+w[mask]-1, y[mask]+h[mask]-1)
 
     mask = ft == 1
     if mask.any():
         hh = h[mask] // 2
-        results[mask] = S(y[mask], x[mask], y[mask]+hh-1, x[mask]+w[mask]-1) \
-                      - S(y[mask]+hh, x[mask], y[mask]+h[mask]-1, x[mask]+w[mask]-1)
+        results[mask] = sum_region(ii, x[mask], y[mask], x[mask]+w[mask]-1, y[mask]+hh-1) \
+                        - sum_region(ii, x[mask], y[mask]+hh, x[mask]+w[mask]-1, y[mask]+h[mask]-1)
 
     mask = ft == 2
     if mask.any():
         tw = w[mask] // 3
-        results[mask] = S(y[mask], x[mask],       y[mask]+h[mask]-1, x[mask]+tw-1) \
-                      - 2*S(y[mask], x[mask]+tw,     y[mask]+h[mask]-1, x[mask]+2*tw-1) \
-                      + S(y[mask], x[mask]+2*tw,   y[mask]+h[mask]-1, x[mask]+w[mask]-1)
+        results[mask] = - sum_region(ii, x[mask],      y[mask], x[mask]+tw-1,    y[mask]+h[mask]-1) \
+                        + 2*sum_region(ii, x[mask]+tw,   y[mask], x[mask]+2*tw-1,  y[mask]+h[mask]-1) \
+                        - sum_region(ii, x[mask]+2*tw, y[mask], x[mask]+w[mask]-1, y[mask]+h[mask]-1)
 
     mask = ft == 3
     if mask.any():
         th = h[mask] // 3
-        results[mask] = S(y[mask],      x[mask], y[mask]+th-1,   x[mask]+w[mask]-1) \
-                      - 2*S(y[mask]+th,   x[mask], y[mask]+2*th-1, x[mask]+w[mask]-1) \
-                      + S(y[mask]+2*th, x[mask], y[mask]+h[mask]-1, x[mask]+w[mask]-1)
+        results[mask] = - sum_region(ii, x[mask], y[mask],      x[mask]+w[mask]-1, y[mask]+th-1) \
+                        + 2*sum_region(ii, x[mask], y[mask]+th,   x[mask]+w[mask]-1, y[mask]+2*th-1) \
+                        - sum_region(ii, x[mask], y[mask]+2*th, x[mask]+w[mask]-1, y[mask]+h[mask]-1)
 
     mask = ft == 4
     if mask.any():
         hw, hh = w[mask]//2, h[mask]//2
-        results[mask] = S(y[mask],    x[mask],    y[mask]+hh-1,   x[mask]+hw-1) \
-                      - S(y[mask],    x[mask]+hw, y[mask]+hh-1,   x[mask]+w[mask]-1) \
-                      - S(y[mask]+hh, x[mask],    y[mask]+h[mask]-1, x[mask]+hw-1) \
-                      + S(y[mask]+hh, x[mask]+hw, y[mask]+h[mask]-1, x[mask]+w[mask]-1)
+        results[mask] = sum_region(ii, x[mask],    y[mask],    x[mask]+hw-1,      y[mask]+hh-1) \
+                        - sum_region(ii, x[mask]+hw, y[mask],    x[mask]+w[mask]-1, y[mask]+hh-1) \
+                        - sum_region(ii, x[mask],    y[mask]+hh, x[mask]+hw-1,      y[mask]+h[mask]-1) \
+                        + sum_region(ii, x[mask]+hw, y[mask]+hh, x[mask]+w[mask]-1, y[mask]+h[mask]-1)
 
     return results.astype(np.float64)
 
@@ -372,7 +327,7 @@ def _fill_mmap_chunk(X_list, features, mmap_path, mmap_shape, row_offset=0, augm
     mmap = np.memmap(mmap_path, dtype=np.float32, mode='r+', shape=mmap_shape)
 
     try:
-        results = Parallel(n_jobs=n_jobs, backend='loky', verbose=0)(
+        results = Parallel(n_jobs=n_jobs, backend='multiprocessing', verbose=0)(
             delayed(_process_chunk_to_array)(chunk)
             for chunk in tqdm(chunks, desc=f'  {desc}')
         )
@@ -492,7 +447,7 @@ def find_theta(scores_pos, target_detection):
 
 
 # ──────────────────────────────────────────────────────────────
-# 6. PREDICCIÓN ONLINE Y CHECKPOINTING
+# 6. PREDICCIÓN Y CHECKPOINTING
 # ──────────────────────────────────────────────────────────────
 
 def cascade_predict_online(img, cascade):
@@ -781,15 +736,15 @@ if __name__ == '__main__':
     NUM_NEG_TEST = 100_000 
 
     # ── Carga de datos de entrenamiento ────────────────────────
-    X_pos_train  = load_positives(PATH_FACES_TRAIN)
+    X_pos_train  = load_images(PATH_FACES_TRAIN)
     bg_train     = load_background_paths(PATH_BACKGROUNDS)
 
     # ── Carga de datos de test (estáticos, desde disco) ────────
     print('\nCargando imágenes de test positivas...')
-    X_pos_test = load_positives(PATH_FACES_TEST, test=True)
+    X_pos_test = load_images(PATH_FACES_TEST, test=True)
 
     print(f'\nMinando {NUM_NEG_TEST} crops negativos de test (operación única)...')
-    X_neg_test    = load_negatives_test(PATH_BACKGROUNDS_TEST)
+    X_neg_test    = load_images(PATH_BACKGROUNDS_TEST, is_negative=True, test=True)
 
     print(f'\nTrain positivos : {len(X_pos_train)}')
     print(f'Train negativos minados en cada ronda: {len(X_pos_train)}')
