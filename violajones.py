@@ -5,12 +5,6 @@ Cascada de clasificadores AdaBoost con features Haar horizontales y verticales.
 Checkpointing granular.
 - Carga de positivos con Data Augmentation automático (Espejo).
 - Mining dinámico de negativos a partir de imágenes de fondo grandes.
-- Solución a errores de memoria/pickle usando backend de threading.
-
-CAMBIOS:
-  - Las features Haar NO se guardan en pkl (se regeneran en memoria, son deterministas).
-  - El conjunto de TEST es estático: caras desde PATH_FACES_TEST y crops negativos
-    desde PATH_BACKGROUNDS_TEST. No hay train_test_split.
 """
 
 import os
@@ -473,8 +467,6 @@ def _stage_ckpt_path(stage_idx): return os.path.join(CHECKPOINT_DIR, f'stage_{st
 def _intra_stage_ckpt_path(stage_idx): return os.path.join(CHECKPOINT_DIR, f'stage_{stage_idx+1:02d}_inprogress.pkl')
 
 def save_intra_stage(stage_idx, clfs, alphas, weights, mmap_path, mmap_shape, y_stage, n_pos, current_fpr, features):
-    # NOTA: 'features' NO se guarda en pkl para ahorrar memoria.
-    # Se regenera en memoria con generate_features() (es determinista).
     data = {
         'stage_idx':  stage_idx,
         'classifiers': clfs,
@@ -546,7 +538,7 @@ def train_cascade(X_pos_pool, backgrounds_pool, num_stages=6, target_detection=0
             print(f'  [TEST ckpt] Etapa {i:2d} | DR={dr_t*100:.2f}%  FPR={fpr_t*100:.4f}%')
     # ───────────────────────────────────────────────────────
 
-    # Las features se generan en memoria (NO se leen/escriben a pkl).
+    # Las features se generan en memoria
     features = generate_features(img_shape, step=1, max_features=max_features)
 
     hard_neg_pool = []
@@ -662,7 +654,7 @@ def train_cascade(X_pos_pool, backgrounds_pool, num_stages=6, target_detection=0
             'classifiers':     stage_clfs,
             'alphas':          stage_alphas,
             'theta':           theta_i,
-            'features_global': features,   # sí se guarda en el stage pkl (es el modelo)
+            'features_global': features,
         }
         cascade.append(stage_data)
 

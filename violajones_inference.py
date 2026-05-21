@@ -1,12 +1,9 @@
 """
 Viola-Jones Inference - Versión VECTORIZADA + NUMBA
 =====================================================
-Mejoras respecto a la versión anterior:
   - cascade_predict_batch portado a Numba (@njit parallel=True).
   - Cascada aplanada a arrays NumPy una sola vez al cargar (flatten_cascade).
   - Warm-up JIT automático al arrancar (cache=True para compilaciones futuras).
-  - FPS calculado como tiempo entre frames consecutivos (corrección bug).
-  - Sin cv2.NORM_MINMAX (normalización correcta por std local por patch).
 
 Uso:
     python violajones_inference.py --stages checkpoints_total --num 12
