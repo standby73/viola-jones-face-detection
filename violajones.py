@@ -120,9 +120,9 @@ def _mine_dynamic_negatives(bg_paths, cascade, required_n, crop_size=24):
     """
     fps = []
     attempts = 0
-    max_attempts = required_n * 2000
+    max_attempts = required_n * 20000000
 
-    CROPS_PER_IMAGE = 100
+    CROPS_PER_IMAGE = 500
 
     desc_str = 'Mining False Positives' if len(cascade) > 0 else 'Mining Random Crops'
     pbar = tqdm(total=required_n, desc=f'  {desc_str}', leave=False)
@@ -151,14 +151,13 @@ def _mine_dynamic_negatives(bg_paths, cascade, required_n, crop_size=24):
 
             crop_final = cv2.resize(crop, (24, 24), interpolation=cv2.INTER_AREA).astype(np.uint8)
 
-            if not is_valid_crop(crop_final):
-                attempts += 1
-                continue
 
             if len(cascade) != 0:
                 if cascade_predict_online(crop_final, cascade) == 1:
                     fps.append(crop_final)
                     pbar.update(1)
+                else:
+                    attempts += 1
             else:
                 fps.append(crop_final)
                 pbar.update(1)
@@ -720,7 +719,7 @@ def evaluate(X_eval, y_eval, cascade, desc='', n_jobs=-1):
 
 if __name__ == '__main__':
     # ── Rutas ──────────────────────────────────────────────────
-    CHECKPOINT_DIR       = 'checkpoints_total'
+    CHECKPOINT_DIR       = 'checkpoints'
     PATH_FACES_TRAIN     = 'dataset/faces_clean'        # Caras de entrenamiento
     PATH_FACES_TEST      = 'dataset/faces_test'         # Caras de test (carpeta fija, estática)
     PATH_BACKGROUNDS     = 'dataset/background_clean'           # Fondos para mining de negativos (train)
