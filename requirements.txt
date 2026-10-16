@@ -1,0 +1,13 @@
+numpy
+opencv-python
+scikit-learn
+joblib
+tqdm
+numba
+# data preparation only
+requests
+Pillow
+imagehash
+ultralytics
+datasets
+# tiny_imagenet_torch (imported by data_prep/05_crop_tiny_imagenet_negatives.py)

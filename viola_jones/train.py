@@ -1,5 +1,5 @@
 """
-Viola-Jones (Haar H/V) - Versión Dinámica
+Viola-Jones face detector: training
 =========================================
 Cascada de clasificadores AdaBoost con features Haar horizontales y verticales.
 Checkpointing granular.

@@ -6,9 +6,9 @@ Viola-Jones Inference - Versión VECTORIZADA + NUMBA
   - Warm-up JIT automático al arrancar (cache=True para compilaciones futuras).
 
 Uso:
-    python violajones_inference.py --stages checkpoints_total --num 12
-    python violajones_inference.py --stages checkpoints_total --num 12 --scale 1.2 --step 0.1
-    python violajones_inference.py --stages checkpoints_total --num 12 --images ( foto.jpg | data/images/ )
+    python viola_jones/inference.py --stages checkpoints_total --num 12
+    python viola_jones/inference.py --stages checkpoints_total --num 12 --scale 1.2 --step 0.1
+    python viola_jones/inference.py --stages checkpoints_total --num 12 --images ( foto.jpg | data/images/ )
 """
 
 import os
